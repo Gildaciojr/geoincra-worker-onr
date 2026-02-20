@@ -6,12 +6,14 @@ import { insertResult, createDocument } from "./db.js";
 
 const PLAYWRIGHT_TIMEOUT_MS = 60_000;
 
+/* =========================================================
+   Helpers
+========================================================= */
 function ensureDir(dirPath) {
   fs.mkdirSync(dirPath, { recursive: true });
 }
 
 function asBackendPath(workerPath) {
-  // worker salva em /data/... e backend enxerga em /app/app/uploads/...
   const abs = path.resolve(workerPath);
   const dataDir = path.resolve(SETTINGS.DATA_DIR);
   if (abs.startsWith(dataDir + path.sep)) {
@@ -40,6 +42,9 @@ function validateJobPayload(job) {
   return { type, value, projectId: Number(projectId) };
 }
 
+/* =========================================================
+   Execução ONR / SIG-RI
+========================================================= */
 export async function executarONR(job, logger) {
   const { type, value, projectId } = validateJobPayload(job);
 
@@ -61,49 +66,53 @@ export async function executarONR(job, logger) {
     const page = await context.newPage();
     page.setDefaultTimeout(PLAYWRIGHT_TIMEOUT_MS);
 
-    // 1) Entrar no login (rota mais estável)
+    /* =========================
+       LOGIN
+    ========================= */
     await page.goto("https://mapa.onr.org.br/sigri/login-usuario", {
       waitUntil: "domcontentloaded"
     });
 
-    // 2) Se existir o botão, clica. Se não existir, segue (pode estar auto-logado)
-    const btn = page.getByText("Entrar com Certificado Digital");
-    if (await btn.count() > 0) {
-      await btn.first().click({ timeout: 15_000 });
+    const btnCert = page.getByText("Entrar com Certificado Digital");
+    if (await btnCert.count() > 0) {
+      await btnCert.first().click({ timeout: 15_000 });
       logger.info({ job_id: job.id }, "Clique em 'Entrar com Certificado Digital' executado");
     } else {
-      logger.info({ job_id: job.id }, "Botão de certificado não encontrado (pode estar auto-logado)");
+      logger.info({ job_id: job.id }, "Botão de certificado não encontrado (auto-login provável)");
     }
 
-    // 3) Abre o mapa principal
     await page.waitForTimeout(3_000);
     await page.goto("https://mapa.onr.org.br", { waitUntil: "domcontentloaded" });
     await page.waitForTimeout(5_000);
 
-    // 4) Selecionar camada de busca
+    /* =========================
+       CAMADA DE BUSCA
+    ========================= */
     try {
       await page.getByText("Camada de Busca").first().click({ timeout: 20_000 });
     } catch {
-      // fallback
       await page.getByText("Camada").first().click({ timeout: 20_000 });
     }
+
     await page.waitForTimeout(800);
 
-    // 5) Tipo de busca
     if (type === "CAR") {
       await page.getByText("Cadastro Ambiental Rural").click({ timeout: 20_000 });
     } else {
       await page.getByText("Endereço").click({ timeout: 20_000 });
     }
 
-    // 6) Input de busca
+    /* =========================
+       BUSCA
+    ========================= */
     const input = page.locator("input:visible").first();
-    if ((await input.count()) === 0) throw new Error("Campo de busca não encontrado no ONR");
+    if ((await input.count()) === 0) {
+      throw new Error("Campo de busca não encontrado no ONR");
+    }
 
     await input.fill(value);
     await page.waitForTimeout(1500);
 
-    // tenta selecionar autocomplete; se não, ENTER
     try {
       const opt = page.locator("[role='listbox'] [role='option']").first();
       if (await opt.count()) {
@@ -117,16 +126,17 @@ export async function executarONR(job, logger) {
 
     await page.waitForTimeout(6_000);
 
-    // 7) (Opcional) clicar no mapa para abrir modal (dependendo do ONR)
-    // Se não abrir nada, não vamos travar aqui — só seguir pro download.
-    try {
-      await page.mouse.click(800, 450);
-      await page.waitForTimeout(1_500);
-    } catch {
-      // ignora
-    }
+    /* =========================
+       🔴 PASSO CRÍTICO — CLICAR NO POLÍGONO
+       (sem isso o botão "Baixar polígono" NÃO aparece)
+    ========================= */
+    logger.info({ job_id: job.id }, "Clicando no polígono no mapa");
+    await page.mouse.click(800, 450);
+    await page.waitForTimeout(3_000);
 
-    // 8) Download KMZ
+    /* =========================
+       DOWNLOAD KMZ
+    ========================= */
     let download;
     try {
       [download] = await Promise.all([
@@ -134,7 +144,6 @@ export async function executarONR(job, logger) {
         page.getByText("Baixar polígono").click({ timeout: 20_000 })
       ]);
     } catch {
-      // fallback por title/aria-label
       [download] = await Promise.all([
         page.waitForEvent("download", { timeout: PLAYWRIGHT_TIMEOUT_MS }),
         page
@@ -154,7 +163,9 @@ export async function executarONR(job, logger) {
 
     const backendPath = asBackendPath(workerPath);
 
-    // 9) Document no backend (download seguro por /api/files/documents/{id})
+    /* =========================
+       REGISTROS NO BANCO
+    ========================= */
     const documentId = await createDocument({
       project_id: projectId,
       doc_type: "ONR_SIGRI_POLIGONO",
@@ -165,7 +176,6 @@ export async function executarONR(job, logger) {
       file_path: backendPath
     });
 
-    // 10) Resultado da automação (auditoria)
     await insertResult(job.id, {
       protocolo: null,
       matricula: null,
@@ -188,7 +198,6 @@ export async function executarONR(job, logger) {
       "ONR/SIG-RI concluído"
     );
   } finally {
-    // ✅ garante limpeza sempre
     await browser.close();
   }
 }
