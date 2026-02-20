@@ -35,10 +35,10 @@ export async function updateJobStatus(jobId, status, errorMessage = null) {
   await pool.query(
     `
     UPDATE automation_jobs
-    SET status = $1,
+    SET status = $1::automation_status,
         error_message = $2,
         finished_at = CASE
-          WHEN $1 IN ('COMPLETED','FAILED') THEN NOW()
+          WHEN $1::automation_status IN ('COMPLETED','FAILED') THEN NOW()
           ELSE finished_at
         END
     WHERE id = $3
