@@ -1,0 +1,38 @@
+services:
+  geoincra_worker_onr:
+    build: .
+    container_name: geoincra_worker_onr
+    restart: always
+
+    environment:
+      # =========================
+      # DATABASE (MESMO DO BACKEND)
+      # =========================
+      DATABASE_URL: postgresql://geoincra_user:domboscojacutinga33@geoincra_postgres:5432/geoincra_db
+
+      # =========================
+      # VOLUME UNIFICADO
+      # =========================
+      DATA_DIR: /data
+      BACKEND_UPLOADS_BASE: /app/app/uploads
+
+      # =========================
+      # CERTIFICADO ONR (A1)
+      # =========================
+      ONR_PFX_PATH: /data/certs/onr_cert.pfx
+      ONR_PFX_PASSWORD: "Yeshua33"
+
+    volumes:
+      - geoincra_uploads:/data
+
+    networks:
+      - backend_default
+
+
+volumes:
+  geoincra_uploads:
+    external: true
+
+networks:
+  backend_default:
+    external: true
