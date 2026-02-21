@@ -42,6 +42,46 @@ function validateJobPayload(job) {
   return { type, value, projectId: Number(projectId) };
 }
 
+async function safeClick(locator, { timeout = 20_000 } = {}) {
+  try {
+    await locator.first().waitFor({ state: "visible", timeout });
+    await locator.first().click({ timeout });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function activateAllLayers(page, logger, jobId) {
+  logger.info({ job_id: jobId }, "Abrindo seletor de camadas");
+
+  // 1) abre o dropdown/btn "Selecionar camadas"
+  const opened =
+    (await safeClick(page.getByText("Selecionar camadas"), { timeout: 20_000 })) ||
+    (await safeClick(page.getByRole("button", { name: /Selecionar camadas/i }), { timeout: 20_000 })) ||
+    (await safeClick(page.locator("text=/Selecionar\\s+camadas/i"), { timeout: 20_000 }));
+
+  if (!opened) {
+    logger.warn({ job_id: jobId }, "Não consegui abrir 'Selecionar camadas' (seguindo mesmo assim)");
+    return false;
+  }
+
+  // 2) clica "Ativar todas"
+  const activated =
+    (await safeClick(page.getByText(/Ativar todas/i), { timeout: 20_000 })) ||
+    (await safeClick(page.getByRole("button", { name: /Ativar todas/i }), { timeout: 20_000 })) ||
+    (await safeClick(page.locator("text=/Ativar\\s+todas/i"), { timeout: 20_000 }));
+
+  if (!activated) {
+    logger.warn({ job_id: jobId }, "Botão 'Ativar todas' não encontrado (camadas podem já estar ativas)");
+    return false;
+  }
+
+  logger.info({ job_id: jobId }, "Camadas ativadas (Ativar todas)");
+  await page.waitForTimeout(6_000); // tempo pro mapa renderizar polígonos
+  return true;
+}
+
 /* =========================================================
    Execução ONR / SIG-RI
 ========================================================= */
@@ -78,29 +118,41 @@ export async function executarONR(job, logger) {
       logger.info({ job_id: job.id }, "Botão de certificado não encontrado (auto-login provável)");
     }
 
+    // abre mapa
     await page.waitForTimeout(3_000);
     await page.goto("https://mapa.onr.org.br", { waitUntil: "domcontentloaded" });
     await page.waitForTimeout(5_000);
 
     /* =========================
-       CAMADA DE BUSCA
+       CAMADA DE BUSCA (topo)
     ========================= */
-    try {
-      await page.getByText("Camada de Busca").first().click({ timeout: 20_000 });
-    } catch {
-      await page.getByText("Camada").first().click({ timeout: 20_000 });
+    // Pelo seu print, o label real é "Camada para busca"
+    // Mantemos fallback para "Camada de Busca"
+    const openedSearchLayer =
+      (await safeClick(page.getByText("Camada para busca"), { timeout: 20_000 })) ||
+      (await safeClick(page.getByText("Camada de Busca"), { timeout: 20_000 })) ||
+      (await safeClick(page.getByText("Camada"), { timeout: 20_000 }));
+
+    if (!openedSearchLayer) {
+      throw new Error("Não consegui abrir o seletor 'Camada para busca'");
     }
 
     await page.waitForTimeout(800);
 
     if (type === "CAR") {
-      await page.getByText("Cadastro Ambiental Rural").click({ timeout: 20_000 });
+      const ok =
+        (await safeClick(page.getByText("Cadastro Ambiental Rural"), { timeout: 20_000 })) ||
+        (await safeClick(page.locator("text=/Cadastro Ambiental Rural/i"), { timeout: 20_000 }));
+      if (!ok) throw new Error("Opção 'Cadastro Ambiental Rural' não encontrada");
     } else {
-      await page.getByText("Endereço").click({ timeout: 20_000 });
+      const ok =
+        (await safeClick(page.getByText("Endereço"), { timeout: 20_000 })) ||
+        (await safeClick(page.locator("text=/Endere[cç]o/i"), { timeout: 20_000 }));
+      if (!ok) throw new Error("Opção 'Endereço' não encontrada");
     }
 
     /* =========================
-       BUSCA
+       BUSCA (campo principal)
     ========================= */
     const input = page.locator("input:visible").first();
     if ((await input.count()) === 0) {
@@ -108,8 +160,9 @@ export async function executarONR(job, logger) {
     }
 
     await input.fill(value);
-    await page.waitForTimeout(1500);
+    await page.waitForTimeout(1_500);
 
+    // autocomplete ou Enter
     try {
       const opt = page.locator("[role='listbox'] [role='option']").first();
       if (await opt.count()) {
@@ -124,39 +177,55 @@ export async function executarONR(job, logger) {
     await page.waitForTimeout(6_000);
 
     /* =========================
-       ATIVAR POLÍGONO NO MAPA
+       PASSO CRÍTICO: ATIVAR CAMADAS
+       (sem isso não tem polígono e não tem "Baixar polígono")
     ========================= */
+    await activateAllLayers(page, logger, job.id);
+
+    /* =========================
+       CLICAR NO POLÍGONO (abre modal)
+    ========================= */
+    logger.info({ job_id: job.id }, "Tentando selecionar polígono no mapa");
+
+    // clique em área central (ajuste fino pode ser necessário dependendo do zoom)
     try {
-      logger.info({ job_id: job.id }, "Clicando no polígono no mapa");
-      await page.mouse.click(800, 450);
-      await page.waitForTimeout(3_000);
+      await page.mouse.click(900, 520);
+      await page.waitForTimeout(2_500);
     } catch {
-      logger.warn({ job_id: job.id }, "Clique no mapa não foi possível (seguindo mesmo assim)");
+      logger.warn({ job_id: job.id }, "Clique no mapa falhou (seguindo mesmo assim)");
     }
 
     /* =========================
-       DOWNLOAD KMZ (OPCIONAL)
+       DOWNLOAD KMZ
     ========================= */
+    // IMPORTANTÍSSIMO: só tenta clicar se estiver visível (evita timeout besta)
+    const baixarPoligono = page.getByText(/Baixar pol[ií]gono/i).first();
+
     let download = null;
+    if (await baixarPoligono.count()) {
+      try {
+        await baixarPoligono.waitFor({ state: "visible", timeout: 20_000 });
 
-    const downloadButton = page
-      .locator(
-        "text=/Baixar\\s+polígono/i, " +
-        "[title*='Baixar'], " +
-        "[aria-label*='Baixar'], " +
-        "button:has-text('Baixar')"
-      )
-      .first();
+        logger.info({ job_id: job.id }, "Botão 'Baixar polígono' visível, iniciando download");
+        [download] = await Promise.all([
+          page.waitForEvent("download", { timeout: PLAYWRIGHT_TIMEOUT_MS }),
+          baixarPoligono.click({ timeout: 20_000 })
+        ]);
+      } catch {
+        // fallback extra (alguns casos o botão é ícone)
+        const fallbackBtn = page.locator(
+          "button:has-text('Baixar'), [title*='Baixar'], [aria-label*='Baixar']"
+        ).first();
 
-    if (await downloadButton.count()) {
-      logger.info({ job_id: job.id }, "Botão de download encontrado");
-
-      [download] = await Promise.all([
-        page.waitForEvent("download", { timeout: PLAYWRIGHT_TIMEOUT_MS }),
-        downloadButton.click({ timeout: 20_000 })
-      ]);
-    } else {
-      logger.warn({ job_id: job.id }, "ONR não disponibilizou KMZ para este imóvel");
+        if (await fallbackBtn.count()) {
+          await fallbackBtn.waitFor({ state: "visible", timeout: 20_000 });
+          logger.info({ job_id: job.id }, "Fallback de download encontrado, clicando");
+          [download] = await Promise.all([
+            page.waitForEvent("download", { timeout: PLAYWRIGHT_TIMEOUT_MS }),
+            fallbackBtn.click({ timeout: 20_000 })
+          ]);
+        }
+      }
     }
 
     /* =========================
@@ -185,6 +254,13 @@ export async function executarONR(job, logger) {
         description: `Polígono ONR/SIG-RI (${type}: ${value})`,
         file_path: backendPath
       });
+
+      logger.info({ job_id: job.id, document_id: documentId }, "KMZ salvo e document criado");
+    } else {
+      logger.warn(
+        { job_id: job.id },
+        "Não houve download (modal pode não ter aberto ou imóvel sem KMZ disponível)"
+      );
     }
 
     /* =========================
@@ -196,7 +272,7 @@ export async function executarONR(job, logger) {
       cnm: null,
       cartorio: null,
       data_pedido: null,
-      file_path: backendPath,
+      file_path: backendPath, // pode ser null (OK)
       metadata_json: {
         fonte: "ONR_SIGRI",
         document_id: documentId,
@@ -210,7 +286,7 @@ export async function executarONR(job, logger) {
 
     logger.info(
       { job_id: job.id, project_id: projectId, document_id: documentId },
-      "ONR/SIG-RI finalizado com sucesso"
+      "ONR/SIG-RI finalizado"
     );
   } finally {
     await browser.close();
