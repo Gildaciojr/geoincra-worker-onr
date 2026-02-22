@@ -228,67 +228,73 @@ export async function executarONR(job, logger) {
       }
     }
 
-    /* =========================
-       SALVAMENTO (SE EXISTIR)
-    ========================= */
-    let backendPath = null;
-    let documentId = null;
-    let workerPath = null;
+/* =========================
+   SALVAMENTO
+========================= */
+let backendPath = null;
+let documentId = null;
+let workerPath = null;
 
-    if (download) {
-      const outDir = path.join(SETTINGS.DATA_DIR, "onr-sigri");
-      ensureDir(outDir);
+if (download) {
+  const outDir = path.join(SETTINGS.DATA_DIR, "onr-sigri");
+  ensureDir(outDir);
 
-      const fileName = `onr_${projectId}_${Date.now()}.kmz`;
-      workerPath = path.join(outDir, fileName);
+  const fileName = `onr_${projectId}_${Date.now()}.kmz`;
+  workerPath = path.join(outDir, fileName);
 
-      await download.saveAs(workerPath);
-      backendPath = asBackendPath(workerPath);
+  await download.saveAs(workerPath);
+  backendPath = asBackendPath(workerPath);
 
-      documentId = await createDocument({
-        project_id: projectId,
-        doc_type: "ONR_SIGRI_POLIGONO",
-        stored_filename: fileName,
-        original_filename: fileName,
-        content_type: "application/vnd.google-earth.kmz",
-        description: `Polígono ONR/SIG-RI (${type}: ${value})`,
-        file_path: backendPath
-      });
+  documentId = await createDocument({
+    project_id: projectId,
+    doc_type: "ONR_SIGRI_POLIGONO",
+    stored_filename: fileName,
+    original_filename: fileName,
+    content_type: "application/vnd.google-earth.kmz",
+    description: `Polígono ONR/SIG-RI (${type}: ${value})`,
+    file_path: backendPath
+  });
 
-      logger.info({ job_id: job.id, document_id: documentId }, "KMZ salvo e document criado");
-    } else {
-      logger.warn(
-        { job_id: job.id },
-        "Não houve download (modal pode não ter aberto ou imóvel sem KMZ disponível)"
-      );
+  logger.info(
+    { job_id: job.id, document_id: documentId },
+    "KMZ salvo e document criado"
+  );
+
+  /* =========================
+     RESULTADO DA AUTOMAÇÃO
+     (SÓ QUANDO HÁ KMZ)
+  ========================= */
+  await insertResult(job.id, {
+    protocolo: null,
+    matricula: null,
+    cnm: null,
+    cartorio: null,
+    data_pedido: null,
+    file_path: backendPath,
+    metadata_json: {
+      fonte: "ONR_SIGRI",
+      document_id: documentId,
+      download_disponivel: true,
+      search: { type, value },
+      saved_worker_path: workerPath,
+      saved_backend_path: backendPath,
+      processed_at_utc: new Date().toISOString()
     }
+  });
 
-    /* =========================
-       RESULTADO DA AUTOMAÇÃO
-    ========================= */
-    await insertResult(job.id, {
-      protocolo: null,
-      matricula: null,
-      cnm: null,
-      cartorio: null,
-      data_pedido: null,
-      file_path: backendPath, // pode ser null (OK)
-      metadata_json: {
-        fonte: "ONR_SIGRI",
-        document_id: documentId,
-        download_disponivel: Boolean(download),
-        search: { type, value },
-        saved_worker_path: workerPath,
-        saved_backend_path: backendPath,
-        processed_at_utc: new Date().toISOString()
-      }
-    });
+  logger.info(
+    { job_id: job.id, project_id: projectId, document_id: documentId },
+    "ONR/SIG-RI finalizado COM KMZ"
+  );
+} else {
+  logger.warn(
+    { job_id: job.id, project_id: projectId },
+    "ONR/SIG-RI finalizado SEM KMZ (imóvel não disponibiliza polígono)"
+  );
+}
 
-    logger.info(
-      { job_id: job.id, project_id: projectId, document_id: documentId },
-      "ONR/SIG-RI finalizado"
-    );
-  } finally {
-    await browser.close();
-  }
+/* NÃO EXISTE MAIS insertResult FORA DO IF */
+
+} finally {
+  await browser.close(); }
 }
