@@ -22,19 +22,34 @@ function asBackendPath(workerPath) {
   return abs;
 }
 
+function normalizeLatLng(value) {
+  // Aceita "-11.457972, -61.233511" ou "-11.457972 -61.233511"
+  const match = value.match(/(-?\d+\.\d+)[,\s]+(-?\d+\.\d+)/);
+  if (!match) {
+    throw new Error("Formato inválido de Latitude/Longitude");
+  }
+  return `${match[1]}, ${match[2]}`;
+}
+
 function validateJobPayload(job) {
   const payload = job?.payload_json;
   const search = payload?.search;
 
-  const type = (search?.type || "").toString().trim().toUpperCase();
-  const value = (search?.value || "").toString().trim();
-
   if (!payload) throw new Error("Payload inválido: payload_json ausente");
   if (!search) throw new Error("Payload inválido: search ausente");
-  if (!["CAR", "ENDERECO"].includes(type)) {
-    throw new Error("Payload inválido: search.type deve ser CAR ou ENDERECO");
+
+  let type = String(search.type || "").trim().toUpperCase();
+  let value = String(search.value || "").trim();
+
+  if (!["CAR", "ENDERECO", "LAT_LNG"].includes(type)) {
+    throw new Error("search.type inválido");
   }
-  if (!value) throw new Error("Payload inválido: search.value vazio");
+
+  if (!value) throw new Error("search.value vazio");
+
+  if (type === "LAT_LNG") {
+    value = normalizeLatLng(value);
+  }
 
   const projectId = job?.project_id;
   if (!projectId) throw new Error("ONR_SIGRI_CONSULTA exige project_id");
@@ -53,32 +68,19 @@ async function safeClick(locator, { timeout = 20_000 } = {}) {
 }
 
 async function activateAllLayers(page, logger, jobId) {
-  logger.info({ job_id: jobId }, "Abrindo seletor de camadas");
+  logger.info({ job_id: jobId }, "Ativando todas as camadas");
 
-  // 1) abre o dropdown/btn "Selecionar camadas"
   const opened =
-    (await safeClick(page.getByText("Selecionar camadas"), { timeout: 20_000 })) ||
-    (await safeClick(page.getByRole("button", { name: /Selecionar camadas/i }), { timeout: 20_000 })) ||
-    (await safeClick(page.locator("text=/Selecionar\\s+camadas/i"), { timeout: 20_000 }));
+    (await safeClick(page.getByText("Selecionar camadas"))) ||
+    (await safeClick(page.locator("text=/Selecionar\\s+camadas/i")));
 
   if (!opened) {
-    logger.warn({ job_id: jobId }, "Não consegui abrir 'Selecionar camadas' (seguindo mesmo assim)");
+    logger.warn({ job_id: jobId }, "Seletor de camadas não encontrado");
     return false;
   }
 
-  // 2) clica "Ativar todas"
-  const activated =
-    (await safeClick(page.getByText(/Ativar todas/i), { timeout: 20_000 })) ||
-    (await safeClick(page.getByRole("button", { name: /Ativar todas/i }), { timeout: 20_000 })) ||
-    (await safeClick(page.locator("text=/Ativar\\s+todas/i"), { timeout: 20_000 }));
-
-  if (!activated) {
-    logger.warn({ job_id: jobId }, "Botão 'Ativar todas' não encontrado (camadas podem já estar ativas)");
-    return false;
-  }
-
-  logger.info({ job_id: jobId }, "Camadas ativadas (Ativar todas)");
-  await page.waitForTimeout(6_000); // tempo pro mapa renderizar polígonos
+  await safeClick(page.getByText(/Ativar todas/i));
+  await page.waitForTimeout(6_000);
   return true;
 }
 
@@ -88,254 +90,138 @@ async function activateAllLayers(page, logger, jobId) {
 export async function executarONR(job, logger) {
   const { type, value, projectId } = validateJobPayload(job);
 
-  logger.info(
-    { job_id: job.id, project_id: projectId, search_type: type },
-    "Iniciando ONR/SIG-RI"
-  );
+  logger.info({ job_id: job.id, search_type: type }, "Iniciando ONR/SIG-RI");
 
   const browser = await chromium.launch({
     headless: true,
-    args: ["--no-sandbox", "--disable-dev-shm-usage"]
+    args: ["--no-sandbox", "--disable-dev-shm-usage"],
   });
+
+  let dadosImovel = null;
 
   try {
     const context = await browser.newContext({ acceptDownloads: true });
     const page = await context.newPage();
     page.setDefaultTimeout(PLAYWRIGHT_TIMEOUT_MS);
 
-    /* =========================
-       LOGIN
-    ========================= */
-    await page.goto("https://mapa.onr.org.br/sigri/login-usuario", {
-      waitUntil: "domcontentloaded"
-    });
-
+    /* LOGIN */
+    await page.goto("https://mapa.onr.org.br/sigri/login-usuario");
     const btnCert = page.getByText("Entrar com Certificado Digital");
-    if (await btnCert.count() > 0) {
-      await btnCert.first().click({ timeout: 15_000 });
-      logger.info({ job_id: job.id }, "Clique em 'Entrar com Certificado Digital' executado");
-    } else {
-      logger.info({ job_id: job.id }, "Botão de certificado não encontrado (auto-login provável)");
-    }
+    if (await btnCert.count()) await btnCert.first().click();
 
-    // abre mapa
-    await page.waitForTimeout(3_000);
-    await page.goto("https://mapa.onr.org.br", { waitUntil: "domcontentloaded" });
+    await page.goto("https://mapa.onr.org.br");
     await page.waitForTimeout(5_000);
 
-    /* =========================
-       CAMADA DE BUSCA (topo)
-    ========================= */
-    // Pelo seu print, o label real é "Camada para busca"
-    // Mantemos fallback para "Camada de Busca"
-    const openedSearchLayer =
-      (await safeClick(page.getByText("Camada para busca"), { timeout: 20_000 })) ||
-      (await safeClick(page.getByText("Camada de Busca"), { timeout: 20_000 })) ||
-      (await safeClick(page.getByText("Camada"), { timeout: 20_000 }));
-
-    if (!openedSearchLayer) {
-      throw new Error("Não consegui abrir o seletor 'Camada para busca'");
-    }
-
-    await page.waitForTimeout(800);
+    /* CAMADA DE BUSCA */
+    await safeClick(page.getByText("Camada para busca"));
+    await page.waitForTimeout(500);
 
     if (type === "CAR") {
-      const ok =
-        (await safeClick(page.getByText("Cadastro Ambiental Rural"), { timeout: 20_000 })) ||
-        (await safeClick(page.locator("text=/Cadastro Ambiental Rural/i"), { timeout: 20_000 }));
-      if (!ok) throw new Error("Opção 'Cadastro Ambiental Rural' não encontrada");
+      await safeClick(page.getByText(/Cadastro Ambiental Rural/i));
+    } else if (type === "LAT_LNG") {
+      await safeClick(page.getByText(/Latitude e Longitude/i));
     } else {
-      const ok =
-        (await safeClick(page.getByText("Endereço"), { timeout: 20_000 })) ||
-        (await safeClick(page.locator("text=/Endere[cç]o/i"), { timeout: 20_000 }));
-      if (!ok) throw new Error("Opção 'Endereço' não encontrada");
+      await safeClick(page.getByText(/Endere[cç]o/i));
     }
 
-    /* =========================
-       BUSCA (campo principal)
-    ========================= */
-    const input = page.locator("input:visible").first();
-    if ((await input.count()) === 0) {
-      throw new Error("Campo de busca não encontrado no ONR");
-    }
-
+    /* BUSCA */
+    const input = page.locator("input.geocoder-control-input").first();
     await input.fill(value);
-    await page.waitForTimeout(1_500);
-
-    // autocomplete ou Enter
-    try {
-      const opt = page.locator("[role='listbox'] [role='option']").first();
-      if (await opt.count()) {
-        await opt.click({ timeout: 10_000 });
-      } else {
-        await input.press("Enter");
-      }
-    } catch {
-      await input.press("Enter");
-    }
-
+    await input.press("Enter");
     await page.waitForTimeout(6_000);
 
-    // =================================================
-// VERIFICA SE A BUSCA NÃO RETORNOU RESULTADOS
-// (CAR ou ENDEREÇO inexistente)
-// =================================================
-const semResultado = await page.getByText(
-  /Não foi possível localizar|nenhum resultado/i
-).count();
+    /* SEM RESULTADO */
+    if (await page.getByText(/Não foi possível localizar/i).count()) {
+      await insertResult(job.id, {
+        file_path: null,
+        metadata_json: {
+          fonte: "ONR_SIGRI",
+          search: { type, value },
+          download_disponivel: false,
+          motivo: "Nenhum resultado encontrado",
+          processed_at_utc: new Date().toISOString(),
+        },
+      });
+      return;
+    }
 
-if (semResultado > 0) {
-  await insertResult(job.id, {
-    protocolo: null,
-    matricula: null,
-    cnm: null,
-    cartorio: null,
-    data_pedido: null,
-    file_path: null,
-    metadata_json: {
-      fonte: "ONR_SIGRI",
-      download_disponivel: false,
-      motivo:
-        "O Mapa de Registro de Imóveis do Brasil não retornou resultados para o valor informado",
-      search: { type, value },
-      processed_at_utc: new Date().toISOString(),
-    },
-  });
-
-  logger.warn(
-    { job_id: job.id, search: { type, value } },
-    "ONR sem resultados"
-  );
-
-  return; // ⛔ PARA A AUTOMAÇÃO AQUI (SEM QUEBRAR)
-}
-
-    /* =========================
-       PASSO CRÍTICO: ATIVAR CAMADAS
-       (sem isso não tem polígono e não tem "Baixar polígono")
-    ========================= */
+    /* CAMADAS */
     await activateAllLayers(page, logger, job.id);
 
-    /* =========================
-       CLICAR NO POLÍGONO (abre modal)
-    ========================= */
-    logger.info({ job_id: job.id }, "Tentando selecionar polígono no mapa");
+    /* CLIQUE NO MAPA */
+    const canvas = page.locator("#map canvas.leaflet-zoom-animated").first();
+    const box = await canvas.boundingBox();
+    await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+    await page.waitForTimeout(3_000);
 
-    // clique em área central (ajuste fino pode ser necessário dependendo do zoom)
-    try {
-      await page.mouse.click(900, 520);
-      await page.waitForTimeout(2_500);
-    } catch {
-      logger.warn({ job_id: job.id }, "Clique no mapa falhou (seguindo mesmo assim)");
+    /* MODAL */
+    const popup = page.locator(".leaflet-popup-content").first();
+    await popup.waitFor({ state: "visible", timeout: 20_000 });
+    const text = await popup.innerText();
+
+    function extract(label) {
+      const r = new RegExp(`${label}\\s*:?\\s*([^\\n]+)`, "i");
+      const m = text.match(r);
+      return m ? m[1].trim() : null;
     }
 
-    /* =========================
-       DOWNLOAD KMZ
-    ========================= */
-    // IMPORTANTÍSSIMO: só tenta clicar se estiver visível (evita timeout besta)
-    const baixarPoligono = page.getByText(/Baixar pol[ií]gono/i).first();
+    dadosImovel = {
+      camada: extract("Camada"),
+      codigo_sigef: extract("Sigef"),
+      nome_area: extract("Nome"),
+      matricula: extract("Matrícula"),
+      municipio: extract("Município"),
+      uf: extract("UF"),
+      ccir_sncr: extract("CCIR|SNCR"),
+    };
 
+    /* DOWNLOAD */
     let download = null;
-    if (await baixarPoligono.count()) {
-      try {
-        await baixarPoligono.waitFor({ state: "visible", timeout: 20_000 });
-
-        logger.info({ job_id: job.id }, "Botão 'Baixar polígono' visível, iniciando download");
-        [download] = await Promise.all([
-          page.waitForEvent("download", { timeout: PLAYWRIGHT_TIMEOUT_MS }),
-          baixarPoligono.click({ timeout: 20_000 })
-        ]);
-      } catch {
-        // fallback extra (alguns casos o botão é ícone)
-        const fallbackBtn = page.locator(
-          "button:has-text('Baixar'), [title*='Baixar'], [aria-label*='Baixar']"
-        ).first();
-
-        if (await fallbackBtn.count()) {
-          await fallbackBtn.waitFor({ state: "visible", timeout: 20_000 });
-          logger.info({ job_id: job.id }, "Fallback de download encontrado, clicando");
-          [download] = await Promise.all([
-            page.waitForEvent("download", { timeout: PLAYWRIGHT_TIMEOUT_MS }),
-            fallbackBtn.click({ timeout: 20_000 })
-          ]);
-        }
-      }
+    const baixar = page.getByText(/Baixar pol[ií]gono/i);
+    if (await baixar.count()) {
+      [download] = await Promise.all([
+        page.waitForEvent("download"),
+        baixar.first().click(),
+      ]);
     }
 
-/* =========================
-   SALVAMENTO (SEMPRE)
-========================= */
-let backendPath = null;
-let documentId = null;
-let workerPath = null;
-let downloadDisponivel = false;
-let downloadMotivo = null;
+    let backendPath = null;
+    let documentId = null;
 
-if (download) {
-  const outDir = path.join(SETTINGS.DATA_DIR, "onr-sigri");
-  ensureDir(outDir);
+    if (download) {
+      const outDir = path.join(SETTINGS.DATA_DIR, "onr-sigri");
+      ensureDir(outDir);
 
-  const fileName = `onr_${projectId}_${Date.now()}.kmz`;
-  workerPath = path.join(outDir, fileName);
+      const fileName = `onr_${projectId}_${Date.now()}.kmz`;
+      const workerPath = path.join(outDir, fileName);
+      await download.saveAs(workerPath);
+      backendPath = asBackendPath(workerPath);
 
-  await download.saveAs(workerPath);
-  backendPath = asBackendPath(workerPath);
-  downloadDisponivel = true;
+      documentId = await createDocument({
+        project_id: projectId,
+        doc_type: "ONR_SIGRI_POLIGONO",
+        stored_filename: fileName,
+        original_filename: fileName,
+        content_type: "application/vnd.google-earth.kmz",
+        description: "Polígono ONR/SIG-RI",
+        file_path: backendPath,
+      });
+    }
 
-  documentId = await createDocument({
-    project_id: projectId,
-    doc_type: "ONR_SIGRI_POLIGONO",
-    stored_filename: fileName,
-    original_filename: fileName,
-    content_type: "application/vnd.google-earth.kmz",
-    description: `Polígono ONR/SIG-RI (${type}: ${value})`,
-    file_path: backendPath
-  });
+    await insertResult(job.id, {
+      file_path: backendPath,
+      metadata_json: {
+        fonte: "ONR_SIGRI",
+        search: { type, value },
+        imovel: dadosImovel,
+        document_id: documentId,
+        download_disponivel: Boolean(backendPath),
+        processed_at_utc: new Date().toISOString(),
+      },
+    });
 
-  logger.info(
-    { job_id: job.id, document_id: documentId },
-    "KMZ salvo e document criado"
-  );
-} else {
-  downloadMotivo = "Imóvel não disponibiliza polígono no ONR/SIG-RI";
-  logger.warn(
-    { job_id: job.id, project_id: projectId },
-    downloadMotivo
-  );
-}
-
-/* =========================
-   RESULTADO DA AUTOMAÇÃO
-   (SEMPRE EXISTE)
-========================= */
-await insertResult(job.id, {
-  protocolo: null,
-  matricula: null,
-  cnm: null,
-  cartorio: null,
-  data_pedido: null,
-  file_path: backendPath, // pode ser null
-  metadata_json: {
-    fonte: "ONR_SIGRI",
-    document_id: documentId,
-    download_disponivel: downloadDisponivel,
-    download_motivo: downloadMotivo,
-    search: { type, value },
-    saved_worker_path: workerPath,
-    saved_backend_path: backendPath,
-    processed_at_utc: new Date().toISOString()
+    logger.info({ job_id: job.id }, "ONR/SIG-RI finalizado com sucesso");
+  } finally {
+    await browser.close();
   }
-});
-
-logger.info(
-  {
-    job_id: job.id,
-    project_id: projectId,
-    download_disponivel: downloadDisponivel
-  },
-  "ONR/SIG-RI finalizado"
-);
-} finally {
-  await browser.close();
-}
 }
