@@ -176,6 +176,40 @@ export async function executarONR(job, logger) {
 
     await page.waitForTimeout(6_000);
 
+    // =================================================
+// VERIFICA SE A BUSCA NÃO RETORNOU RESULTADOS
+// (CAR ou ENDEREÇO inexistente)
+// =================================================
+const semResultado = await page.getByText(
+  /Não foi possível localizar|nenhum resultado/i
+).count();
+
+if (semResultado > 0) {
+  await insertResult(job.id, {
+    protocolo: null,
+    matricula: null,
+    cnm: null,
+    cartorio: null,
+    data_pedido: null,
+    file_path: null,
+    metadata_json: {
+      fonte: "ONR_SIGRI",
+      download_disponivel: false,
+      motivo:
+        "O Mapa de Registro de Imóveis do Brasil não retornou resultados para o valor informado",
+      search: { type, value },
+      processed_at_utc: new Date().toISOString(),
+    },
+  });
+
+  logger.warn(
+    { job_id: job.id, search: { type, value } },
+    "ONR sem resultados"
+  );
+
+  return; // ⛔ PARA A AUTOMAÇÃO AQUI (SEM QUEBRAR)
+}
+
     /* =========================
        PASSO CRÍTICO: ATIVAR CAMADAS
        (sem isso não tem polígono e não tem "Baixar polígono")
@@ -229,11 +263,13 @@ export async function executarONR(job, logger) {
     }
 
 /* =========================
-   SALVAMENTO
+   SALVAMENTO (SEMPRE)
 ========================= */
 let backendPath = null;
 let documentId = null;
 let workerPath = null;
+let downloadDisponivel = false;
+let downloadMotivo = null;
 
 if (download) {
   const outDir = path.join(SETTINGS.DATA_DIR, "onr-sigri");
@@ -244,6 +280,7 @@ if (download) {
 
   await download.saveAs(workerPath);
   backendPath = asBackendPath(workerPath);
+  downloadDisponivel = true;
 
   documentId = await createDocument({
     project_id: projectId,
@@ -259,42 +296,46 @@ if (download) {
     { job_id: job.id, document_id: documentId },
     "KMZ salvo e document criado"
   );
-
-  /* =========================
-     RESULTADO DA AUTOMAÇÃO
-     (SÓ QUANDO HÁ KMZ)
-  ========================= */
-  await insertResult(job.id, {
-    protocolo: null,
-    matricula: null,
-    cnm: null,
-    cartorio: null,
-    data_pedido: null,
-    file_path: backendPath,
-    metadata_json: {
-      fonte: "ONR_SIGRI",
-      document_id: documentId,
-      download_disponivel: true,
-      search: { type, value },
-      saved_worker_path: workerPath,
-      saved_backend_path: backendPath,
-      processed_at_utc: new Date().toISOString()
-    }
-  });
-
-  logger.info(
-    { job_id: job.id, project_id: projectId, document_id: documentId },
-    "ONR/SIG-RI finalizado COM KMZ"
-  );
 } else {
+  downloadMotivo = "Imóvel não disponibiliza polígono no ONR/SIG-RI";
   logger.warn(
     { job_id: job.id, project_id: projectId },
-    "ONR/SIG-RI finalizado SEM KMZ (imóvel não disponibiliza polígono)"
+    downloadMotivo
   );
 }
 
-/* NÃO EXISTE MAIS insertResult FORA DO IF */
+/* =========================
+   RESULTADO DA AUTOMAÇÃO
+   (SEMPRE EXISTE)
+========================= */
+await insertResult(job.id, {
+  protocolo: null,
+  matricula: null,
+  cnm: null,
+  cartorio: null,
+  data_pedido: null,
+  file_path: backendPath, // pode ser null
+  metadata_json: {
+    fonte: "ONR_SIGRI",
+    document_id: documentId,
+    download_disponivel: downloadDisponivel,
+    download_motivo: downloadMotivo,
+    search: { type, value },
+    saved_worker_path: workerPath,
+    saved_backend_path: backendPath,
+    processed_at_utc: new Date().toISOString()
+  }
+});
 
+logger.info(
+  {
+    job_id: job.id,
+    project_id: projectId,
+    download_disponivel: downloadDisponivel
+  },
+  "ONR/SIG-RI finalizado"
+);
 } finally {
-  await browser.close(); }
+  await browser.close();
+}
 }
