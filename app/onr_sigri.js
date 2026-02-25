@@ -23,7 +23,6 @@ function asBackendPath(workerPath) {
 }
 
 function normalizeLatLng(value) {
-  // Aceita "-11.457972, -61.233511" ou "-11.457972 -61.233511"
   const match = value.match(/(-?\d+\.\d+)[,\s]+(-?\d+\.\d+)/);
   if (!match) {
     throw new Error("Formato inválido de Latitude/Longitude");
@@ -71,15 +70,15 @@ async function activateAllLayers(page, logger, jobId) {
   logger.info({ job_id: jobId }, "Ativando todas as camadas");
 
   const opened =
-    (await safeClick(page.getByText("Selecionar camadas"))) ||
-    (await safeClick(page.locator("text=/Selecionar\\s+camadas/i")));
+    (await safeClick(page.locator(".placeholder-selecionar-camadas"))) ||
+    (await safeClick(page.getByText(/Selecionar camadas/i)));
 
   if (!opened) {
     logger.warn({ job_id: jobId }, "Seletor de camadas não encontrado");
     return false;
   }
 
-  await safeClick(page.getByText(/Ativar todas/i));
+  await safeClick(page.locator(".btn-toggle-camadas-all"));
   await page.waitForTimeout(6_000);
   return true;
 }
@@ -96,8 +95,6 @@ export async function executarONR(job, logger) {
     headless: true,
     args: ["--no-sandbox", "--disable-dev-shm-usage"],
   });
-
-  let dadosImovel = null;
 
   try {
     const context = await browser.newContext({ acceptDownloads: true });
@@ -130,82 +127,72 @@ export async function executarONR(job, logger) {
     await input.press("Enter");
     await page.waitForTimeout(6_000);
 
-    /* SEM RESULTADO */
-    if (await page.getByText(/Não foi possível localizar/i).count()) {
-      await insertResult(job.id, {
-        file_path: null,
-        metadata_json: {
-          fonte: "ONR_SIGRI",
-          search: { type, value },
-          download_disponivel: false,
-          motivo: "Nenhum resultado encontrado",
-          processed_at_utc: new Date().toISOString(),
-        },
-      });
-      return;
-    }
-
     /* CAMADAS */
     await activateAllLayers(page, logger, job.id);
 
-    /* CLIQUE NO MAPA */
-    const canvas = page.locator("#map canvas.leaflet-zoom-animated").first();
-    const box = await canvas.boundingBox();
-    await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+    /* CLIQUE EXATO NO PONTO DA BUSCA (CÍRCULO VERMELHO) */
+    const searchMarker = page.locator(".leaflet-interactive").first();
+    await searchMarker.waitFor({ state: "visible", timeout: 20_000 });
+    await searchMarker.click();
     await page.waitForTimeout(3_000);
 
     /* MODAL */
     const popup = page.locator(".leaflet-popup-content").first();
     await popup.waitFor({ state: "visible", timeout: 20_000 });
-    const text = await popup.innerText();
 
-    function extract(label) {
-      const r = new RegExp(`${label}\\s*:?\\s*([^\\n]+)`, "i");
-      const m = text.match(r);
-      return m ? m[1].trim() : null;
+    const rows = popup.locator("div");
+    const data = {};
+
+    const count = await rows.count();
+    for (let i = 0; i < count; i++) {
+      const text = (await rows.nth(i).innerText()).trim();
+      const [label, value] = text.split(":").map(v => v?.trim());
+      if (label && value) data[label] = value;
     }
 
-    dadosImovel = {
-      camada: extract("Camada"),
-      codigo_sigef: extract("Sigef"),
-      nome_area: extract("Nome"),
-      matricula: extract("Matrícula"),
-      municipio: extract("Município"),
-      uf: extract("UF"),
-      ccir_sncr: extract("CCIR|SNCR"),
+    const dadosImovel = {
+      camada: data["Camada"] || null,
+      codigo_sigef: data["Código Sigef"] || null,
+      nome_area: data["Nome da Área"] || null,
+      matricula: data["Matrícula"] || null,
+      municipio: data["Município"] || null,
+      uf: data["UF"] || null,
+      ccir_sncr: data["CCIR/SNCR"] || null,
     };
 
-    /* DOWNLOAD */
-    let download = null;
-    const baixar = page.getByText(/Baixar pol[ií]gono/i);
-    if (await baixar.count()) {
-      [download] = await Promise.all([
-        page.waitForEvent("download"),
-        baixar.first().click(),
-      ]);
-    }
-
+    /* DOWNLOAD OPCIONAL DO POLÍGONO */
     let backendPath = null;
     let documentId = null;
 
-    if (download) {
-      const outDir = path.join(SETTINGS.DATA_DIR, "onr-sigri");
-      ensureDir(outDir);
+    const downloadBtn = page.locator(".leaflet-download-poligono i");
 
-      const fileName = `onr_${projectId}_${Date.now()}.kmz`;
-      const workerPath = path.join(outDir, fileName);
-      await download.saveAs(workerPath);
-      backendPath = asBackendPath(workerPath);
+    if (await downloadBtn.count()) {
+      try {
+        const [download] = await Promise.all([
+          page.waitForEvent("download", { timeout: 15_000 }),
+          downloadBtn.first().click(),
+        ]);
 
-      documentId = await createDocument({
-        project_id: projectId,
-        doc_type: "ONR_SIGRI_POLIGONO",
-        stored_filename: fileName,
-        original_filename: fileName,
-        content_type: "application/vnd.google-earth.kmz",
-        description: "Polígono ONR/SIG-RI",
-        file_path: backendPath,
-      });
+        const outDir = path.join(SETTINGS.DATA_DIR, "onr-sigri");
+        ensureDir(outDir);
+
+        const fileName = `onr_${projectId}_${Date.now()}.kmz`;
+        const workerPath = path.join(outDir, fileName);
+        await download.saveAs(workerPath);
+        backendPath = asBackendPath(workerPath);
+
+        documentId = await createDocument({
+          project_id: projectId,
+          doc_type: "ONR_SIGRI_POLIGONO",
+          stored_filename: fileName,
+          original_filename: fileName,
+          content_type: "application/vnd.google-earth.kmz",
+          description: "Polígono ONR/SIG-RI",
+          file_path: backendPath,
+        });
+      } catch {
+        logger.warn({ job_id: job.id }, "Polígono não disponível para download");
+      }
     }
 
     await insertResult(job.id, {
