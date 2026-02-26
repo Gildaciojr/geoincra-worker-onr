@@ -5,6 +5,7 @@ import { SETTINGS } from "./settings.js";
 import { insertResult, createDocument } from "./db.js";
 
 const PLAYWRIGHT_TIMEOUT_MS = 60_000;
+const POPUP_PAGE_LIMIT = 6; // limite de páginas do popup
 
 /* =========================================================
    Helpers
@@ -45,7 +46,6 @@ function validateJobPayload(job) {
   if (!value) throw new Error("search.value vazio");
 
   if (type === "LAT_LNG") value = normalizeLatLng(value);
-
   if (!job.project_id) throw new Error("project_id obrigatório");
 
   return { type, value, projectId: Number(job.project_id) };
@@ -125,42 +125,56 @@ export async function executarONR(job, logger) {
     /* ATIVAR CAMADAS */
     await activateAllLayers(page, logger, job.id);
 
-    /* 🔴 CLIQUE NO CENTRO DO MAPA (PONTO EXATO DA BUSCA) */
+    /* CLIQUE NO MAPA (região central da busca) */
     const map = page.locator("#map");
     const box = await map.boundingBox();
-
-    await page.mouse.click(
-      box.x + box.width / 2,
-      box.y + box.height / 2
-    );
-
+    await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
     await page.waitForTimeout(3_000);
 
-    /* MODAL */
+    /* POPUP */
     const popup = page.locator(".leaflet-popup-content").first();
     await popup.waitFor({ state: "visible", timeout: 20_000 });
 
-    const rows = popup.locator("div");
-    const data = {};
+    let dadosImovel = null;
 
-    const count = await rows.count();
-    for (let i = 0; i < count; i++) {
-      const text = (await rows.nth(i).innerText()).trim();
-      const [label, val] = text.split(":").map(v => v?.trim());
-      if (label && val) data[label] = val;
+    /* 🔁 PAGINAÇÃO DO POPUP */
+    for (let i = 0; i < POPUP_PAGE_LIMIT; i++) {
+      const text = await popup.innerText();
+
+      if (
+        /Sigef|Matrícula|CCIR|SNCR|Nome da Área/i.test(text)
+      ) {
+        const rows = popup.locator("div");
+        const data = {};
+        const count = await rows.count();
+
+        for (let j = 0; j < count; j++) {
+          const rowText = (await rows.nth(j).innerText()).trim();
+          const [label, val] = rowText.split(":").map(v => v?.trim());
+          if (label && val) data[label] = val;
+        }
+
+        dadosImovel = {
+          camada: data["Camada"] || null,
+          codigo_sigef: data["Código Sigef"] || null,
+          nome_area: data["Nome da Área"] || null,
+          matricula: data["Matrícula"] || null,
+          municipio: data["Município"] || null,
+          uf: data["UF"] || null,
+          ccir_sncr: data["CCIR/SNCR"] || null,
+        };
+
+        break;
+      }
+
+      const nextBtn = page.locator("#mapa-paginacao-next i");
+      if (!(await nextBtn.count())) break;
+
+      await nextBtn.first().click();
+      await page.waitForTimeout(1_500);
     }
 
-    const dadosImovel = {
-      camada: data["Camada"] || null,
-      codigo_sigef: data["Código Sigef"] || null,
-      nome_area: data["Nome da Área"] || null,
-      matricula: data["Matrícula"] || null,
-      municipio: data["Município"] || null,
-      uf: data["UF"] || null,
-      ccir_sncr: data["CCIR/SNCR"] || null,
-    };
-
-    /* DOWNLOAD OPCIONAL */
+    /* DOWNLOAD OPCIONAL DO POLÍGONO */
     let backendPath = null;
     let documentId = null;
 
