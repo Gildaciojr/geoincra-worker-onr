@@ -24,9 +24,7 @@ function asBackendPath(workerPath) {
 
 function normalizeLatLng(value) {
   const match = value.match(/(-?\d+\.\d+)[,\s]+(-?\d+\.\d+)/);
-  if (!match) {
-    throw new Error("Formato inválido de Latitude/Longitude");
-  }
+  if (!match) throw new Error("Formato inválido de Latitude/Longitude");
   return `${match[1]}, ${match[2]}`;
 }
 
@@ -34,8 +32,8 @@ function validateJobPayload(job) {
   const payload = job?.payload_json;
   const search = payload?.search;
 
-  if (!payload) throw new Error("Payload inválido: payload_json ausente");
-  if (!search) throw new Error("Payload inválido: search ausente");
+  if (!payload) throw new Error("Payload inválido");
+  if (!search) throw new Error("search ausente");
 
   let type = String(search.type || "").trim().toUpperCase();
   let value = String(search.value || "").trim();
@@ -46,20 +44,17 @@ function validateJobPayload(job) {
 
   if (!value) throw new Error("search.value vazio");
 
-  if (type === "LAT_LNG") {
-    value = normalizeLatLng(value);
-  }
+  if (type === "LAT_LNG") value = normalizeLatLng(value);
 
-  const projectId = job?.project_id;
-  if (!projectId) throw new Error("ONR_SIGRI_CONSULTA exige project_id");
+  if (!job.project_id) throw new Error("project_id obrigatório");
 
-  return { type, value, projectId: Number(projectId) };
+  return { type, value, projectId: Number(job.project_id) };
 }
 
-async function safeClick(locator, { timeout = 20_000 } = {}) {
+async function safeClick(locator, timeout = 15_000) {
   try {
     await locator.first().waitFor({ state: "visible", timeout });
-    await locator.first().click({ timeout });
+    await locator.first().click();
     return true;
   } catch {
     return false;
@@ -74,7 +69,7 @@ async function activateAllLayers(page, logger, jobId) {
     (await safeClick(page.getByText(/Selecionar camadas/i)));
 
   if (!opened) {
-    logger.warn({ job_id: jobId }, "Seletor de camadas não encontrado");
+    logger.warn({ job_id: jobId }, "Botão Selecionar camadas não encontrado");
     return false;
   }
 
@@ -113,10 +108,10 @@ export async function executarONR(job, logger) {
     await safeClick(page.getByText("Camada para busca"));
     await page.waitForTimeout(500);
 
-    if (type === "CAR") {
-      await safeClick(page.getByText(/Cadastro Ambiental Rural/i));
-    } else if (type === "LAT_LNG") {
+    if (type === "LAT_LNG") {
       await safeClick(page.getByText(/Latitude e Longitude/i));
+    } else if (type === "CAR") {
+      await safeClick(page.getByText(/Cadastro Ambiental Rural/i));
     } else {
       await safeClick(page.getByText(/Endere[cç]o/i));
     }
@@ -125,15 +120,20 @@ export async function executarONR(job, logger) {
     const input = page.locator("input.geocoder-control-input").first();
     await input.fill(value);
     await input.press("Enter");
-    await page.waitForTimeout(6_000);
+    await page.waitForTimeout(5_000);
 
-    /* CAMADAS */
+    /* ATIVAR CAMADAS */
     await activateAllLayers(page, logger, job.id);
 
-    /* CLIQUE EXATO NO PONTO DA BUSCA (CÍRCULO VERMELHO) */
-    const searchMarker = page.locator(".leaflet-interactive").first();
-    await searchMarker.waitFor({ state: "visible", timeout: 20_000 });
-    await searchMarker.click();
+    /* 🔴 CLIQUE NO CENTRO DO MAPA (PONTO EXATO DA BUSCA) */
+    const map = page.locator("#map");
+    const box = await map.boundingBox();
+
+    await page.mouse.click(
+      box.x + box.width / 2,
+      box.y + box.height / 2
+    );
+
     await page.waitForTimeout(3_000);
 
     /* MODAL */
@@ -146,8 +146,8 @@ export async function executarONR(job, logger) {
     const count = await rows.count();
     for (let i = 0; i < count; i++) {
       const text = (await rows.nth(i).innerText()).trim();
-      const [label, value] = text.split(":").map(v => v?.trim());
-      if (label && value) data[label] = value;
+      const [label, val] = text.split(":").map(v => v?.trim());
+      if (label && val) data[label] = val;
     }
 
     const dadosImovel = {
@@ -160,12 +160,11 @@ export async function executarONR(job, logger) {
       ccir_sncr: data["CCIR/SNCR"] || null,
     };
 
-    /* DOWNLOAD OPCIONAL DO POLÍGONO */
+    /* DOWNLOAD OPCIONAL */
     let backendPath = null;
     let documentId = null;
 
     const downloadBtn = page.locator(".leaflet-download-poligono i");
-
     if (await downloadBtn.count()) {
       try {
         const [download] = await Promise.all([
@@ -191,7 +190,7 @@ export async function executarONR(job, logger) {
           file_path: backendPath,
         });
       } catch {
-        logger.warn({ job_id: job.id }, "Polígono não disponível para download");
+        logger.warn({ job_id: job.id }, "Polígono não disponível");
       }
     }
 
